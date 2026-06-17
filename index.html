@@ -62,6 +62,7 @@
 </script>
 <script type="module">
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { feature } from 'topojson-client';
 
 // ---------- 基本 ----------
@@ -78,6 +79,32 @@ document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.fog = new THREE.Fog(0xbde3f0, 1.5, 5.5); // 空気遠近：低空では遠くが空に溶ける（高度で動的調整）
+
+// ---------- GLBモデル管理（CC0アセット読み込み） ----------
+const glbLoader = new GLTFLoader();
+const GLB_TEMPLATES = {};
+function loadGLB(key, url, scale, toon) {
+  glbLoader.load(url, gltf => {
+    const model = gltf.scene;
+    model.scale.setScalar(scale);
+    if (toon) model.traverse(c => {
+      if (c.isMesh) {
+        const old = c.material;
+        c.material = new THREE.MeshToonMaterial({
+          color: old.color || 0x88bb88,
+          gradientMap: typeof toonGrad !== 'undefined' ? toonGrad : null,
+        });
+        c.castShadow = true;
+      }
+    });
+    GLB_TEMPLATES[key] = model;
+    console.log('GLB loaded:', key);
+  });
+}
+function cloneGLB(key) {
+  const t = GLB_TEMPLATES[key];
+  return t ? t.clone() : null;
+}
 const camera = new THREE.PerspectiveCamera(58, innerWidth / innerHeight, 0.1, 2000);
 function resize() {
   camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
@@ -575,7 +602,12 @@ function mulberry32(a) {
 }
 const HOUSE_COLORS = [0xf2dcc8, 0xe8d0d8, 0xd8e2c8, 0xe6e0cc];
 const BLDG_COLORS = [0xd8dce8, 0xe2d8e0, 0xcfd8d2, 0xe6e2d0, 0xa8c4dc, 0xc89484, 0xb8c8c0]; // ガラス青・レンガも混ぜて多様性
-function makeTreeG(rnd, leaf) { // キューブ樹冠（マイクラ風・街の縮小に合わせ小型化）
+function makeTreeG(rnd, leaf) {
+  const glb = cloneGLB('tree_glb');
+  if (glb) {
+    glb.scale.setScalar(0.3 + rnd() * 0.15);
+    return glb;
+  }
   const t = new THREE.Group();
   const c = leaf || 0x8fcb9b;
   t.add(box(0.1, 0.26, 0.1, 0xc9a98f, 0, 0.13, 0));
@@ -626,6 +658,7 @@ function buildVoxelLib() {
   }
 }
 buildVoxelLib();
+loadGLB('tree_glb', 'assets/models/nature/tree_01.glb', 0.35, true);
 function makeHouseG(rnd) { return VOXEL_LIB.house[(rnd() * VOXEL_LIB.house.length) | 0].clone(); }
 function makeBuildingG(rnd) { return VOXEL_LIB.bldg[(rnd() * VOXEL_LIB.bldg.length) | 0].clone(); }
 function makeTowerG(rnd) { return VOXEL_LIB.tower[(rnd() * VOXEL_LIB.tower.length) | 0].clone(); }
