@@ -1,0 +1,1278 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>まじょたび</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #bde3f0; }
+  canvas { touch-action: none; }
+  #hud {
+    position: fixed; top: 12px; left: 12px; display: flex; gap: 8px; z-index: 10;
+    font-family: "Hiragino Maru Gothic ProN", "Rounded Mplus 1c", sans-serif;
+  }
+  .chip {
+    border-radius: 14px; padding: 8px 14px; font-size: 13px;
+    background: rgba(255,255,255,.72); color: #5a6a8a;
+    box-shadow: 0 2px 6px rgba(90,106,138,.25); backdrop-filter: blur(4px);
+  }
+  #note {
+    position: fixed; bottom: 12px; left: 12px; z-index: 10; font-size: 12px;
+    color: #5a6a8a; background: rgba(255,255,255,.6); border-radius: 10px;
+    padding: 6px 10px; font-family: sans-serif;
+  }
+  #monitor {
+    position: fixed; right: 12px; bottom: 12px; z-index: 10;
+    background: rgba(255,255,255,.78); border-radius: 14px; padding: 10px;
+    box-shadow: 0 2px 6px rgba(90,106,138,.25); backdrop-filter: blur(4px);
+    font-family: "Hiragino Maru Gothic ProN", "Rounded Mplus 1c", sans-serif;
+  }
+  #map { display: block; border-radius: 8px; }
+  #place { margin-top: 6px; font-size: 12px; color: #5a6a8a; text-align: center; }
+  #loc {
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 10;
+    background: rgba(255,255,255,.78); border-radius: 16px; padding: 9px 20px;
+    font-size: 15px; font-weight: 600; color: #4a5a7a;
+    box-shadow: 0 2px 6px rgba(90,106,138,.25); backdrop-filter: blur(4px);
+    font-family: "Hiragino Maru Gothic ProN", "Rounded Mplus 1c", sans-serif;
+    white-space: nowrap; transition: background .4s, color .4s;
+  }
+  #loc.lm { background: rgba(255,240,205,.92); color: #8a6a2a; } /* ランドマーク接近 */
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="chip" id="compass">方位 --</div>
+  <div class="chip" id="alt">高度 --</div>
+  <div class="chip" id="pos">--</div>
+</div>
+<div id="note">地球を組み立て中…（本物の海岸線データを読み込むのだ）</div>
+<div id="monitor">
+  <canvas id="map" width="220" height="110"></canvas>
+  <div id="place">--</div>
+</div>
+<div id="loc">--</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+  "topojson-client": "https://cdn.jsdelivr.net/npm/topojson-client@3/+esm"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { feature } from 'topojson-client';
+
+// ---------- 基本 ----------
+const R = 400; // 地球半径。50→200→400（都市の広がり優先。10倍級は「二段スケール構造」が必要なので次の大物へ）
+const LAND_R = R + 0.5; // 陸面の半径（固定値。R比例だと半径拡大で陸が高くなりすぎ「地下スタート」バグの原因になった）
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true; // オデッセイ路線①：やわらかい影
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping; // 映画調の色味
+renderer.toneMappingExposure = 1.12;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0xbde3f0, 1.5, 5.5); // 空気遠近：低空では遠くが空に溶ける（高度で動的調整）
+const camera = new THREE.PerspectiveCamera(58, innerWidth / innerHeight, 0.1, 2000);
+function resize() {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+addEventListener('resize', resize);
+
+const latLonToVec3 = (latDeg, lonDeg, r) => {
+  const p = latDeg * Math.PI / 180, l = lonDeg * Math.PI / 180;
+  return new THREE.Vector3(r * Math.cos(p) * Math.cos(l), r * Math.sin(p), -r * Math.cos(p) * Math.sin(l));
+};
+
+// ---------- 太陽（地球ローカルに固定＝飛ぶ方角で昼夜が変わる） ----------
+const SUN_LOCAL = latLonToVec3(15, 165, 1); // 太平洋の上が正午ごろ→日本スタートは昼
+const sunLight = new THREE.DirectionalLight(0xfff4dd, 1.6);
+sunLight.castShadow = true;
+sunLight.shadow.mapSize.set(2048, 2048);
+sunLight.shadow.camera.left = -14; sunLight.shadow.camera.right = 14;
+sunLight.shadow.camera.top = 14; sunLight.shadow.camera.bottom = -14;
+sunLight.shadow.camera.near = 10; sunLight.shadow.camera.far = 160;
+sunLight.shadow.bias = -0.0002;
+sunLight.shadow.normalBias = 0.06; // 斜面のしましま（シャドウアクネ）防止
+scene.add(sunLight);
+scene.add(sunLight.target);
+const amb = new THREE.AmbientLight(0xb8cfe8, 0.9);
+scene.add(amb);
+
+// ---------- 海岸線データ → 陸マスク（Canvasでラスタライズ） ----------
+const MASK_W = 4096, MASK_H = 2048; // 海岸線のキレを上げるため倍解像度
+let maskData = null;
+function maskAt(latDeg, lonDeg) {
+  if (!maskData) return false;
+  const x = Math.min(MASK_W - 1, Math.max(0, ((lonDeg + 180) / 360 * MASK_W) | 0));
+  const y = Math.min(MASK_H - 1, Math.max(0, ((90 - latDeg) / 180 * MASK_H) | 0));
+  return maskData[(y * MASK_W + x) * 4] > 128;
+}
+async function buildLandMask() {
+  const cv = document.createElement('canvas');
+  cv.width = MASK_W; cv.height = MASK_H;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, MASK_W, MASK_H);
+  ctx.fillStyle = '#fff';
+  try {
+    const topo = await (await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json')).json();
+    const land = feature(topo, topo.objects.land);
+    for (const geom of land.features ? land.features.map(f => f.geometry) : [land.geometry]) {
+      const polys = geom.type === 'Polygon' ? [geom.coordinates] : geom.coordinates;
+      for (const rings of polys) {
+        ctx.beginPath();
+        for (const ring of rings) {
+          ring.forEach(([lon, lat], i) => {
+            const x = (lon + 180) / 360 * MASK_W, y = (90 - lat) / 180 * MASK_H;
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+          });
+          ctx.closePath();
+        }
+        ctx.fill('evenodd');
+      }
+    }
+  } catch (e) { // オフライン時フォールバック：それっぽい大陸
+    for (let i = 0; i < 9; i++) {
+      ctx.beginPath();
+      ctx.ellipse(Math.random() * MASK_W, MASK_H * (0.25 + Math.random() * 0.5),
+        120 + Math.random() * 260, 80 + Math.random() * 160, Math.random() * 3, 0, 6.3);
+      ctx.fill();
+    }
+  }
+  maskData = ctx.getImageData(0, 0, MASK_W, MASK_H).data;
+}
+
+// ---------- 地球本体（頂点カラーで陸と海を塗る） ----------
+const globe = new THREE.Group();
+scene.add(globe);
+const C = {
+  seaA: new THREE.Color(0x8fd0e0), seaB: new THREE.Color(0x7ec4d8),
+  tropic: new THREE.Color(0x9ed89a), temperate: new THREE.Color(0xaade9c),
+  desert: new THREE.Color(0xe8d8a8), tundra: new THREE.Color(0xcfe0c8),
+  ice: new THREE.Color(0xf5f7f2),
+};
+function landColor(latDeg) {
+  const a = Math.abs(latDeg);
+  let c;
+  if (a > 68) c = C.ice.clone();
+  else if (a > 55) c = C.tundra.clone();
+  else if (a > 32) c = C.temperate.clone();
+  else if (a > 16) c = Math.random() < 0.45 ? C.desert.clone() : C.temperate.clone();
+  else c = C.tropic.clone();
+  return c.offsetHSL(0, 0, (Math.random() - 0.5) * 0.04);
+}
+// 地球の色は頂点でなくテクスチャに焼く＝海岸線がピクセル精度でパキッとする（四国もくっきり）
+function buildGlobeTexture() {
+  const W = 4096, H = 2048;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d');
+  const img = ctx.createImageData(W, H);
+  const D = img.data;
+  const BANDS = [ // [|lat|下限, r, g, b]（降順）
+    [68, 0xf5, 0xf7, 0xf2], // 氷
+    [55, 0xcf, 0xe0, 0xc8], // ツンドラ
+    [32, 0xaa, 0xde, 0x9c], // 温帯の緑
+    [16, 0xc8, 0xd0, 0x8e], // 乾燥帯（はげ感を抑えた黄緑寄り）
+    [0, 0x9e, 0xd8, 0x9a],  // 熱帯の緑
+  ];
+  for (let y = 0; y < H; y++) {
+    const lat = 90 - (y + 0.5) / H * 180;
+    for (let x = 0; x < W; x++) {
+      const lon = (x + 0.5) / W * 360 - 180;
+      const o = (y * W + x) * 4;
+      let r, g, b;
+      const sp = (((x * 1103515245 + y * 374761393) >>> 13) & 31) / 31 - 0.5; // 安い決定論ノイズ
+      if (maskAt(lat, lon)) {
+        if (!maskAt(lat + 0.18, lon) || !maskAt(lat - 0.18, lon) || !maskAt(lat, lon + 0.22) || !maskAt(lat, lon - 0.22)) {
+          r = 0xea; g = 0xd9; b = 0xa8; // 砂浜の縁取り
+        } else {
+          const a = Math.abs(lat);
+          let band = BANDS[4];
+          for (const bd of BANDS) if (a >= bd[0]) { band = bd; break; }
+          r = band[1]; g = band[2]; b = band[3];
+          const t = vnoise(lon * 0.22, lat * 0.22); // 草原・森のまだら
+          if (t > 0.35) { r -= 14; g -= 6; b -= 12; }
+          else if (t < -0.45) { r += 10; g += 8; b += 4; }
+          const k2 = sp * 14; r += k2; g += k2; b += k2; // 草のスペックル＝はげ地解消
+        }
+      } else {
+        const n1 = maskAt(lat + 0.5, lon) || maskAt(lat - 0.5, lon) || maskAt(lat, lon + 0.6) || maskAt(lat, lon - 0.6);
+        const n2 = n1 || maskAt(lat + 1.2, lon) || maskAt(lat - 1.2, lon) || maskAt(lat, lon + 1.4) || maskAt(lat, lon - 1.4);
+        if (n1) { r = 0x9e; g = 0xe0; b = 0xe6; }       // 浅瀬ターコイズ
+        else if (n2) { r = 0x7c; g = 0xc6; b = 0xd8; }  // 中間
+        else { r = 0x5e; g = 0xa8; b = 0xc6; }          // 外洋
+        const k2 = sp * 5; r += k2; g += k2; b += k2;
+      }
+      D[o] = r; D[o + 1] = g; D[o + 2] = b; D[o + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tx = new THREE.CanvasTexture(cv);
+  tx.colorSpace = THREE.SRGBColorSpace;
+  tx.anisotropy = 8;
+  return tx;
+}
+function buildGlobeMesh() {
+  const geo = new THREE.SphereGeometry(R, 768, 576);
+  const pos = geo.attributes.position, uv = geo.attributes.uv;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i);
+    const lat = Math.asin(Math.min(1, Math.max(-1, v.y / v.length()))) * 180 / Math.PI;
+    const lon = Math.atan2(-v.z, v.x) * 180 / Math.PI;
+    let u = (lon + 180) / 360;
+    if (u < 0.002 && uv.getX(i) > 0.5) u = 1; // 経度±180の継ぎ目
+    uv.setXY(i, u, (lat + 90) / 180);
+    if (maskAt(lat, lon)) {
+      v.multiplyScalar(LAND_R / R); // 陸は固定値ぶん盛り上げる
+      pos.setXYZ(i, v.x, v.y, v.z);
+    }
+  }
+  geo.computeVertexNormals();
+  const gm = new THREE.Mesh(geo, new THREE.MeshToonMaterial({ map: buildGlobeTexture(), gradientMap: toonGrad }));
+  gm.receiveShadow = true; // 地面に建物・魔女の影が落ちる
+  globe.add(gm);
+}
+
+// 大気のふち（安いハロー）
+scene.add(new THREE.Mesh(
+  new THREE.SphereGeometry(R * 1.045, 64, 48),
+  new THREE.MeshBasicMaterial({ color: 0x9fd0f0, transparent: true, opacity: 0.22, side: THREE.BackSide, depthWrite: false })
+));
+// 夜空の星・太陽・月（fogの影響を受けない遠景＝景観のキモ）
+const starGeo = new THREE.BufferGeometry();
+{
+  const sp = new Float32Array(600 * 3);
+  for (let i = 0; i < 600; i++) {
+    const d = new THREE.Vector3().randomDirection().multiplyScalar(1500);
+    sp[i * 3] = d.x; sp[i * 3 + 1] = d.y; sp[i * 3 + 2] = d.z;
+  }
+  starGeo.setAttribute('position', new THREE.BufferAttribute(sp, 3));
+}
+const starMat = new THREE.PointsMaterial({ color: 0xffffff, size: 2.0, sizeAttenuation: false, transparent: true, opacity: 0, fog: false });
+const stars = new THREE.Points(starGeo, starMat);
+stars.frustumCulled = false;
+scene.add(stars);
+const sunBall = new THREE.Mesh(new THREE.SphereGeometry(16, 16, 12), new THREE.MeshBasicMaterial({ color: 0xfff0c0, fog: false }));
+const moonBall = new THREE.Mesh(new THREE.SphereGeometry(9, 16, 12), new THREE.MeshBasicMaterial({ color: 0xeef0f5, fog: false, transparent: true, opacity: 0.9 }));
+scene.add(sunBall, moonBall);
+
+// ---------- 部品工場 ----------
+// オデッセイ路線①：3段トゥーンシェーディング（任天堂風の面の塗り分け）
+const toonGrad = (() => {
+  const d = new Uint8Array([115, 185, 255]);
+  const t = new THREE.DataTexture(d, 3, 1, THREE.RedFormat);
+  t.minFilter = t.magFilter = THREE.NearestFilter;
+  t.needsUpdate = true;
+  return t;
+})();
+const MAT_CACHE = new Map();
+const mat = c => { if (!MAT_CACHE.has(c)) MAT_CACHE.set(c, new THREE.MeshToonMaterial({ color: c, gradientMap: toonGrad })); return MAT_CACHE.get(c); };
+function box(w, h, d, c, x = 0, y = 0, z = 0) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat(c));
+  m.position.set(x, y, z); m.castShadow = true; m.receiveShadow = true; return m;
+}
+function cone(r, h, c, x = 0, y = 0, z = 0, seg = 4) {
+  const m = new THREE.Mesh(new THREE.ConeGeometry(r, h, seg), mat(c));
+  m.position.set(x, y, z); m.castShadow = true; m.receiveShadow = true; return m;
+}
+const windowMat = new THREE.MeshToonMaterial({ color: 0xdce8f0, emissive: 0x000000, gradientMap: toonGrad });
+// 高密度ボクセル地形（InstancedMesh＝数千キューブを1ドローコールで。レゴ感の解消）
+const vnoise = (x, z) => Math.sin(x * 4.7 + z * 2.3) * Math.cos(z * 3.9 - x * 1.7);
+function voxelTerrain(grid, cell, heightFn, colorFn) {
+  const steps = [];
+  for (let ix = 0; ix < grid; ix++) {
+    steps[ix] = [];
+    for (let iz = 0; iz < grid; iz++) {
+      const x = (ix - grid / 2 + 0.5) * cell, z = (iz - grid / 2 + 0.5) * cell;
+      steps[ix][iz] = Math.max(0, Math.round(heightFn(x, z) / cell));
+    }
+  }
+  const items = [];
+  for (let ix = 0; ix < grid; ix++) for (let iz = 0; iz < grid; iz++) {
+    const s = steps[ix][iz];
+    if (s <= 0) continue;
+    let nMin = s;
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      nMin = Math.min(nMin, ((steps[ix + dx] || [])[iz + dz]) ?? 0);
+    }
+    const depth = Math.min(s, Math.max(1, s - nMin + 1)); // 側面が抜けない深さだけ積む
+    const x = (ix - grid / 2 + 0.5) * cell, z = (iz - grid / 2 + 0.5) * cell;
+    for (let k = 0; k < depth; k++) {
+      const y = (s - k) * cell - cell / 2;
+      items.push([x, y, z, colorFn(x, z, y, s * cell)]);
+    }
+  }
+  const im = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(cell, cell, cell),
+    new THREE.MeshToonMaterial({ gradientMap: toonGrad }),
+    items.length
+  );
+  const m4 = new THREE.Matrix4(), col = new THREE.Color();
+  items.forEach(([x, y, z, c], i) => {
+    m4.makeTranslation(x, y, z);
+    im.setMatrixAt(i, m4);
+    im.setColorAt(i, col.set(c));
+  });
+  im.castShadow = true; im.receiveShadow = true;
+  return im;
+}
+// 直方体の組み合わせをキューブ群に変換（表面だけ・1ドローコール）＝建物のボクセル化用
+function voxelModel(cell, parts) {
+  const items = [];
+  for (const [px, py, pz, w, h, d, c] of parts) {
+    const nx = Math.max(1, Math.round(w / cell)), ny = Math.max(1, Math.round(h / cell)), nz = Math.max(1, Math.round(d / cell));
+    for (let ix = 0; ix < nx; ix++) for (let iy = 0; iy < ny; iy++) for (let iz = 0; iz < nz; iz++) {
+      if (ix > 0 && ix < nx - 1 && iy > 0 && iy < ny - 1 && iz > 0 && iz < nz - 1) continue; // 内部は省略
+      items.push([px + (ix - nx / 2 + 0.5) * cell, py + (iy + 0.5) * cell, pz + (iz - nz / 2 + 0.5) * cell, c]);
+    }
+  }
+  const im = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(cell, cell, cell),
+    new THREE.MeshToonMaterial({ gradientMap: toonGrad }),
+    items.length
+  );
+  const m4 = new THREE.Matrix4(), col = new THREE.Color();
+  items.forEach(([x, y, z, c], i) => {
+    m4.makeTranslation(x, y, z);
+    im.setMatrixAt(i, m4);
+    im.setColorAt(i, col.set(c));
+  });
+  im.castShadow = true; im.receiveShadow = true;
+  return im;
+}
+
+// ---------- ランドマーク（実座標に置く＝地球儀のキモ） ----------
+const LANDMARKS = [
+  { name: '富士山', lat: 35.36, lon: 138.73, clear: 0.4, scale: 0.85, build: g => g.add(voxelTerrain(60, 0.078, (x, z) => {
+    const r = Math.hypot(x, z);
+    const mt = Math.max(0, 3.9 * (1 - r / 2.1)) + vnoise(x, z) * 0.12;
+    return Math.max(mt, r < 2.3 ? 0.3 : 0); // 裾野
+  }, (x, z, y) => {
+    if (y < 0.42) return 0x7a9a78; // 裾野の森
+    if (y > 2.55) return vnoise(x * 2.3, z * 2.3) > 0.5 ? 0xeef2f8 : 0xffffff; // 雪冠
+    return [0x8a98c0, 0x95a2c8, 0xa2aed0][Math.abs((x * 13 + z * 7 + y * 11) | 0) % 3]; // 青藍3トーン
+  })) },
+  { name: 'エッフェル塔', lat: 48.86, lon: 2.29, build: g => {
+    const c = 0x9a7a5a; // ブロンズ
+    for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      const leg = box(0.16, 1.1, 0.16, c, sx * 0.5, 0.5, sz * 0.5);
+      leg.rotation.z = -sx * 0.32; leg.rotation.x = sz * 0.32; g.add(leg);
+    }
+    g.add(box(1.4, 0.12, 1.4, c, 0, 1.05, 0));  // 第1展望台
+    g.add(box(0.8, 0.85, 0.8, c, 0, 1.5, 0));
+    g.add(box(1.0, 0.1, 1.0, c, 0, 1.98, 0));   // 第2展望台
+    g.add(cone(0.5, 1.5, c, 0, 2.75, 0, 4));    // 上部テーパー
+    g.add(box(0.36, 0.08, 0.36, c, 0, 3.52, 0)); // 頂上展望台
+    g.add(box(0.05, 0.5, 0.05, c, 0, 3.8, 0));  // アンテナ
+  } },
+  { name: '自由の女神', lat: 40.69, lon: -74.04, build: g => {
+    const v = 0x88c4ae; // 緑青
+    g.add(box(1.15, 0.4, 1.15, 0xb8a888, 0, 0.2, 0));   // 星形要塞（簡略）
+    g.add(box(0.65, 0.95, 0.65, 0xcfc0a0, 0, 0.85, 0)); // 石の台座
+    g.add(box(0.38, 1.05, 0.34, v, 0, 1.85, 0));        // ローブの体
+    g.add(box(0.3, 0.5, 0.14, v, -0.12, 1.7, 0.18));    // 石板を抱える腕
+    g.add(box(0.2, 0.22, 0.2, 0xa8d4be, 0, 2.5, 0));    // 頭
+    g.add(cone(0.24, 0.28, v, 0, 2.7, 0, 7));           // 王冠
+    g.add(box(0.09, 0.85, 0.09, v, 0.26, 2.7, 0));      // 掲げた右腕
+    g.add(cone(0.13, 0.28, 0xf2c050, 0.26, 3.25, 0, 6));// 炬火
+  } },
+  { name: 'ギザのピラミッド', lat: 29.98, lon: 31.13, build: g => {
+    g.add(cone(1.5, 1.7, 0xe8cf98, 0, 0.85, 0, 4));         // クフ王
+    g.add(cone(1.25, 1.45, 0xe0c890, 1.7, 0.72, 0.7, 4));   // カフラー王
+    g.add(cone(0.45, 0.4, 0xf2e4b8, 1.7, 1.55, 0.7, 4));    //（頂部の化粧石）
+    g.add(cone(0.75, 0.85, 0xd8c088, -1.6, 0.42, 0.8, 4));  // メンカウラー王
+    g.add(box(0.6, 0.22, 0.26, 0xd8b878, -0.5, 0.11, -1.4));// スフィンクス胴
+    g.add(box(0.2, 0.32, 0.2, 0xd8b878, -0.74, 0.3, -1.4)); // スフィンクス頭
+  } },
+  { name: 'オペラハウス', lat: -33.86, lon: 151.21, build: g => {
+    g.add(box(2.3, 0.25, 1.1, 0xe8ddcc, 0, 0.12, 0)); // 基壇
+    [-0.7, -0.15, 0.4].forEach((x, i) => {
+      const s = cone(0.5 + i * 0.06, 1.0 + i * 0.12, 0xf7f4ee, x, 0.62, -0.2, 4);
+      s.rotation.z = -0.55; g.add(s);
+    });
+    [0.75, 0.35].forEach((x, i) => {
+      const s = cone(0.4 - i * 0.06, 0.8 - i * 0.1, 0xf2efe6, x, 0.5, 0.3, 4);
+      s.rotation.z = 0.5; g.add(s); // 向かい合う小シェル群
+    });
+  } },
+  { name: 'ビッグベン', lat: 51.50, lon: -0.12, build: g => {
+    g.add(box(0.5, 2.1, 0.5, 0xc8b088, 0, 1.05, 0));
+    g.add(box(0.6, 0.5, 0.6, 0xb8a078, 0, 2.35, 0)); // 時計部
+    for (const [x, z, w, d] of [[0.31, 0, 0.05, 0.3], [-0.31, 0, 0.05, 0.3], [0, 0.31, 0.3, 0.05], [0, -0.31, 0.3, 0.05]]) {
+      const f = new THREE.Mesh(new THREE.BoxGeometry(w, 0.3, d), windowMat);
+      f.position.set(x, 2.35, z); g.add(f); // 四面の文字盤（夜は灯る）
+    }
+    g.add(cone(0.42, 0.55, 0x6a8878, 0, 2.85, 0, 4));
+    g.add(cone(0.16, 0.35, 0xc8b850, 0, 3.25, 0, 4)); // 金の尖塔
+  } },
+  // ---- 第1弾リストからの拡張（2026-06-12） ----
+  { name: '東京タワー', lat: 35.659, lon: 139.745, build: g => {
+    const r = 0xe85a3a, w = 0xf7f3ec; // 紅白
+    for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      const leg = box(0.13, 0.95, 0.13, r, sx * 0.42, 0.45, sz * 0.42);
+      leg.rotation.z = -sx * 0.3; leg.rotation.x = sz * 0.3; g.add(leg);
+    }
+    g.add(box(1.05, 0.12, 1.05, w, 0, 0.95, 0));  // メインデッキ
+    g.add(cone(0.5, 1.1, r, 0, 1.55, 0, 4));
+    g.add(box(0.42, 0.24, 0.42, w, 0, 2.2, 0));   // トップデッキ
+    g.add(cone(0.26, 0.7, r, 0, 2.65, 0, 4));
+    g.add(box(0.05, 0.45, 0.05, w, 0, 3.15, 0));  // アンテナ
+  } },
+  { name: '京都・五重塔', lat: 34.980, lon: 135.747, build: g => { for (let i = 0; i < 5; i++) { g.add(box(0.7 - i * 0.1, 0.26, 0.7 - i * 0.1, 0xd8c8b0, 0, 0.16 + i * 0.5, 0)); g.add(box(1.05 - i * 0.15, 0.1, 1.05 - i * 0.15, 0x8a5a48, 0, 0.4 + i * 0.5, 0)); } g.add(cone(0.1, 0.5, 0xc8a850, 0, 2.75, 0, 4)); } },
+  { name: '厳島神社の大鳥居', lat: 34.296, lon: 132.319, build: g => { g.add(box(0.18, 1.3, 0.18, 0xe07050, -0.55, 0.65, 0)); g.add(box(0.18, 1.3, 0.18, 0xe07050, 0.55, 0.65, 0)); g.add(box(1.8, 0.16, 0.22, 0xe07050, 0, 1.35, 0)); g.add(box(1.3, 0.12, 0.18, 0xe07050, 0, 1.05, 0)); } },
+  { name: '万里の長城',   lat: 40.43,  lon: 116.57, clear: 0.15, build: g => { g.add(box(2.6, 0.45, 0.35, 0xc8bba0, 0, 0.55, 0)); g.add(box(0.5, 0.95, 0.5, 0xb8ab90, -1.3, 0.5, 0)); g.add(box(0.5, 0.95, 0.5, 0xb8ab90, 1.3, 0.5, 0)); g.add(box(1.4, 0.4, 0.3, 0xc8bba0, 0.6, 0.2, 0.5)); } },
+  { name: 'タージマハル', lat: 27.175, lon: 78.042, build: g => { g.add(box(1.7, 0.35, 1.7, 0xf5f0e8, 0, 0.18, 0)); g.add(box(0.9, 0.7, 0.9, 0xf5f0e8, 0, 0.7, 0)); g.add(cone(0.5, 0.8, 0xf5f0e8, 0, 1.45, 0, 8)); for (const [x, z] of [[-0.75, -0.75], [0.75, -0.75], [-0.75, 0.75], [0.75, 0.75]]) g.add(box(0.12, 1.2, 0.12, 0xf5f0e8, x, 0.95, z)); } },
+  { name: 'エベレスト', lat: 27.99, lon: 86.93, clear: 0.4, scale: 0.85, build: g => g.add(voxelTerrain(60, 0.082, (x, z) => {
+    const m1 = Math.max(0, 4.3 * (1 - Math.hypot(x, z) / 2.1));
+    const m2 = Math.max(0, 2.8 * (1 - Math.hypot(x - 1.5, z - 0.5) / 1.3));
+    return Math.max(m1, m2) + vnoise(x, z) * 0.18;
+  }, (x, z, y) => y > 2.0 ? 0xffffff : y > 1.4 ? 0xc8d2e0 : 0x9aa6ba)) },
+  { name: 'アンコールワット', lat: 13.41, lon: 103.87, build: g => { g.add(box(2.0, 0.3, 1.2, 0xa89878, 0, 0.15, 0)); g.add(cone(0.4, 1.5, 0x9a8878, 0, 1.05, 0, 6)); g.add(cone(0.32, 1.1, 0x9a8878, -0.7, 0.85, 0, 6)); g.add(cone(0.32, 1.1, 0x9a8878, 0.7, 0.85, 0, 6)); } },
+  { name: 'カッパドキア', lat: 38.64,  lon: 34.83,  build: g => { g.add(cone(0.5, 1.2, 0xd8b898, -0.6, 0.6, 0, 6)); g.add(cone(0.4, 1.0, 0xcfae8e, 0.4, 0.5, 0.4, 6)); const bc = [0xf2a8c0, 0xf2d898, 0xa8c8e8]; bc.forEach((c, i) => { const b = cone(0.38, 0.55, c, -0.8 + i * 0.8, 2.4 + i * 0.7, (i - 1) * 0.5, 7); b.rotation.x = Math.PI; g.add(b); g.add(box(0.14, 0.12, 0.14, 0x9a8870, -0.8 + i * 0.8, 2.0 + i * 0.7, (i - 1) * 0.5)); }); } },
+  { name: 'ブルジュ・ハリファ', lat: 25.197, lon: 55.274, build: g => { g.add(box(0.55, 2.2, 0.55, 0xc8d0dc, 0, 1.1, 0)); g.add(box(0.34, 0.9, 0.34, 0xc8d0dc, 0, 2.65, 0)); g.add(box(0.08, 0.7, 0.08, 0xb8c0cc, 0, 3.45, 0)); const w = new THREE.Mesh(new THREE.BoxGeometry(0.04, 1.8, 0.3), windowMat); w.position.set(-0.3, 1.2, 0); g.add(w); } },
+  { name: 'キリマンジャロ', lat: -3.07, lon: 37.36, clear: 0.4, scale: 0.85, build: g => g.add(voxelTerrain(64, 0.081,
+    (x, z) => Math.min(2.1, Math.max(0, 2.9 * (1 - Math.hypot(x, z) / 2.5))) + vnoise(x, z) * 0.1,
+    (x, z, y) => y > 1.7 ? 0xffffff : y > 0.9 ? 0xa89880 : 0xb8a890)) },
+  { name: 'モンサンミッシェル', lat: 48.636, lon: -1.511, build: g => { g.add(cone(1.2, 0.9, 0xb8a888, 0, 0.45, 0, 7)); g.add(box(0.55, 0.6, 0.55, 0xe8e0d0, 0, 1.0, 0)); g.add(cone(0.3, 0.9, 0x8a98b8, 0, 1.75, 0, 4)); } },
+  { name: 'オランダの風車群', lat: 51.88, lon: 4.64, build: g => { for (const dx of [-0.7, 0.6]) { g.add(box(0.4, 1.2, 0.4, 0xefe6d2, dx, 0.6, dx * 0.3)); g.add(cone(0.35, 0.4, 0xd99a8a, dx, 1.4, dx * 0.3, 4)); const b1 = box(0.04, 1.3, 0.12, 0xf7f3e8, dx - 0.24, 1.1, dx * 0.3); b1.rotation.x = 0.785; g.add(b1); const b2 = box(0.04, 0.12, 1.3, 0xf7f3e8, dx - 0.24, 1.1, dx * 0.3); b2.rotation.x = 0.785; g.add(b2); } g.add(box(1.8, 0.06, 0.5, 0xf2a8c0, 0, 0.03, 0.8)); } },
+  { name: 'ノイシュヴァンシュタイン城', lat: 47.557, lon: 10.75, build: g => { g.add(box(0.9, 0.8, 0.6, 0xf0ece2, 0, 0.4, 0)); for (const [x, h] of [[-0.45, 1.5], [0.45, 1.3], [0, 1.8]]) { g.add(box(0.26, h, 0.26, 0xf0ece2, x, h / 2, -0.15)); g.add(cone(0.22, 0.5, 0x7a8ab8, x, h + 0.25, -0.15, 6)); } } },
+  { name: 'マッターホルン', lat: 45.976, lon: 7.658, clear: 0.25, scale: 0.85, build: g => g.add(voxelTerrain(50, 0.072,
+    (x, z) => Math.max(0, 3.4 * (1 - Math.hypot(x * 0.82 - 0.18, z * 1.12) / 1.3)) + vnoise(x, z) * 0.14,
+    (x, z, y) => y > 1.9 ? 0xffffff : y > 1.2 ? 0xc8d2e0 : 0xbcc8da)) },
+  { name: 'コロッセオ',   lat: 41.89,  lon: 12.49,  build: g => { const c = new THREE.Mesh(new THREE.CylinderGeometry(1.0, 1.1, 0.8, 12, 1), mat(0xd8c8a8)); c.position.y = 0.4; g.add(c); g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.7, 0.7, 0.85, 12, 1), mat(0xc4b494)).translateY(0.42)); } },
+  { name: 'ピサの斜塔',   lat: 43.723, lon: 10.396, build: g => { const t = box(0.45, 1.7, 0.45, 0xf5f0e8, 0, 0.85, 0); t.rotation.z = 0.16; g.add(t); g.add(box(0.55, 0.12, 0.55, 0xe8e0d0, 0.14, 1.75, 0)); } },
+  { name: 'サグラダファミリア', lat: 41.404, lon: 2.174, build: g => { for (const [x, h] of [[-0.5, 1.7], [-0.17, 2.1], [0.17, 1.9], [0.5, 1.6]]) g.add(cone(0.22, h, 0xc8a890, x, h / 2, 0, 6)); g.add(box(0.05, 2.4, 0.05, 0xe8c050, 0.8, 1.2, 0.3)); g.add(box(0.9, 0.05, 0.05, 0xe8c050, 0.45, 2.35, 0.3)); } },
+  { name: 'サントリーニ島', lat: 36.46, lon: 25.40, build: g => { for (let i = 0; i < 3; i++) { g.add(box(0.6, 0.4, 0.6, 0xf7f3ec, i * 0.4 - 0.4, 0.2 + i * 0.3, 0)); g.add(cone(0.22, 0.3, 0x6a9ad8, i * 0.4 - 0.4, 0.55 + i * 0.3, 0, 8)); } } },
+  { name: '聖ワシリイ大聖堂', lat: 55.752, lon: 37.623, build: g => { g.add(box(1.2, 0.5, 1.2, 0xf0e6da, 0, 0.25, 0)); const dc = [0xe07060, 0x88b888, 0xe8c050, 0x7a8ac8]; dc.forEach((c, i) => { const x = [-0.4, 0.4, -0.4, 0.4][i], z = [-0.4, -0.4, 0.4, 0.4][i]; g.add(box(0.24, 0.6, 0.24, 0xf0e6da, x, 0.8, z)); g.add(cone(0.2, 0.45, c, x, 1.3, z, 8)); }); g.add(box(0.3, 1.1, 0.3, 0xf0e6da, 0, 1.05, 0)); g.add(cone(0.26, 0.55, 0xe8a8b8, 0, 1.85, 0, 8)); } },
+  { name: 'ゴールデンゲートブリッジ', lat: 37.82, lon: -122.48, build: g => {
+    const o = 0xe8643c; // インターナショナルオレンジ
+    g.add(box(4.2, 0.08, 0.42, o, 0, 0.75, 0)); // 路面
+    for (const tx of [-1.1, 1.1]) {
+      g.add(box(0.11, 2.0, 0.11, o, tx, 1.0, -0.15)); // 主塔（門型2本柱）
+      g.add(box(0.11, 2.0, 0.11, o, tx, 1.0, 0.15));
+      g.add(box(0.36, 0.08, 0.34, o, tx, 1.45, 0));   // 塔の横梁
+      g.add(box(0.36, 0.08, 0.34, o, tx, 1.9, 0));
+    }
+    for (const zz of [-0.15, 0.15]) { // メインケーブル（塔頂→中央、塔頂→両端）
+      for (const s of [-1, 1]) {
+        const c1 = box(1.6, 0.035, 0.035, o, s * 0.55, 1.42, zz); c1.rotation.z = s * 0.61; g.add(c1);
+        const c2 = box(1.35, 0.035, 0.035, o, s * 1.6, 1.45, zz); c2.rotation.z = -s * 0.74; g.add(c2);
+      }
+    }
+  } },
+  { name: 'マチュピチュ',  lat: -13.16, lon: -72.545, build: g => { for (let i = 0; i < 3; i++) g.add(box(2.0 - i * 0.5, 0.28, 1.4 - i * 0.3, 0xa8c890, 0, 0.14 + i * 0.28, 0)); g.add(box(0.3, 0.3, 0.3, 0xc8c0b0, -0.3, 1.0, 0)); g.add(box(0.25, 0.25, 0.25, 0xc8c0b0, 0.35, 1.0, 0.2)); } },
+  { name: 'コルコバードのキリスト像', lat: -22.952, lon: -43.21, build: g => { g.add(cone(0.7, 1.0, 0x9aa890, 0, 0.5, 0, 6)); g.add(box(0.3, 0.5, 0.3, 0xe8e8e0, 0, 1.2, 0)); g.add(box(0.22, 0.9, 0.22, 0xe8e8e0, 0, 1.85, 0)); g.add(box(1.3, 0.14, 0.2, 0xe8e8e0, 0, 2.1, 0)); g.add(box(0.16, 0.18, 0.16, 0xe8e8e0, 0, 2.42, 0)); } },
+  { name: 'モアイ像',     lat: -27.13, lon: -109.37, build: g => { g.add(box(1.8, 0.25, 0.6, 0x8a9098, 0, 0.12, 0)); for (let i = 0; i < 4; i++) g.add(box(0.26, 0.65, 0.26, 0x9aa0a8, -0.6 + i * 0.4, 0.55, 0)); } },
+  { name: 'ウユニ塩湖',   lat: -20.13, lon: -67.49, build: g => { g.add(box(2.6, 0.04, 2.6, 0xd8ecf2, 0, 0.02, 0)); g.add(box(0.5, 0.03, 0.5, 0xf5fafc, -0.6, 0.045, 0.5)); g.add(box(0.4, 0.03, 0.4, 0xf5fafc, 0.7, 0.045, -0.4)); } },
+  { name: 'ウルル',       lat: -25.345, lon: 131.037, build: g => { g.add(box(1.8, 0.65, 1.0, 0xd07858, 0, 0.32, 0)); g.add(box(1.3, 0.3, 0.7, 0xd8806a, 0, 0.75, 0)); } },
+];
+function placeLandmarks() {
+  for (const lm of LANDMARKS) {
+    const g = new THREE.Group();
+    lm.build(g); // 光の柱は廃止（機内モニターの名前表示で発見できる）
+    g.name = 'lm:' + lm.name;
+    g.scale.setScalar(lm.scale || 0.5); // 建築系=0.5（縮小後の街と整合）／山岳系=個別指定で雄大さキープ
+    const p = latLonToVec3(lm.lat, lm.lon, LAND_R); // 陸面の上にきっちり立てる（以前は0.4沈んでいた）
+    g.position.copy(p);
+    g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), p.clone().normalize());
+    globe.add(g);
+  }
+}
+
+// ---------- OSM実データ都市レイヤー（東京）：本物の幹線道路・川・公園を重ねる ----------
+function buildOsmCity(data) {
+  const aLat = data.anchor[0], aLon = data.anchor[1];
+  const n = latLonToVec3(aLat, aLon, 1);
+  const northT = new THREE.Vector3(0, 1, 0).addScaledVector(n, -n.y).normalize();
+  const east = northT.clone().cross(n).normalize();
+  const grp = new THREE.Group();
+  grp.position.copy(n.clone().multiplyScalar(LAND_R + 0.02));
+  grp.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(east, n, northT.clone().negate()));
+  const kLat = R * Math.PI / 180, kLon = kLat * Math.cos(aLat * Math.PI / 180);
+  const toXZ = (la, lo) => [(lo - aLon) * kLon, -(la - aLat) * kLat]; // x=東, z=南
+  // 道路・川は細長キューブをインスタンス化（数千セグメント＝各1ドローコール）
+  const seg = (lines, w, c, y) => {
+    const items = [];
+    for (const line of lines) {
+      for (let i = 0; i < line.length - 1; i++) {
+        const [x1, z1] = toXZ(line[i][0], line[i][1]);
+        const [x2, z2] = toXZ(line[i + 1][0], line[i + 1][1]);
+        const len = Math.hypot(x2 - x1, z2 - z1);
+        if (len < 0.004 || len > 3) continue;
+        items.push([(x1 + x2) / 2, (z1 + z2) / 2, len, Math.atan2(-(z2 - z1), x2 - x1)]);
+      }
+    }
+    const im = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(1, 0.012, 1),
+      new THREE.MeshToonMaterial({ color: c, gradientMap: toonGrad }),
+      items.length
+    );
+    const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), sv = new THREE.Vector3(), pv = new THREE.Vector3();
+    const Y = new THREE.Vector3(0, 1, 0);
+    items.forEach(([x, z, len, ang], i) => {
+      q.setFromAxisAngle(Y, ang);
+      sv.set(len, 1, w); pv.set(x, y, z);
+      m4.compose(pv, q, sv);
+      im.setMatrixAt(i, m4);
+    });
+    im.receiveShadow = true;
+    grp.add(im);
+    return items.length;
+  };
+  const nr = seg(data.roads, 0.045, 0x6e7278, 0.024);  // 幹線道路網
+  const nv = seg(data.rivers, 0.09, 0x7ec4d8, 0.03);   // 隅田川・荒川・多摩川
+  for (const poly of data.parks) {                     // 皇居・代々木公園などの緑
+    const shp = new THREE.Shape(poly.map(([la, lo]) => { const [x, z] = toXZ(la, lo); return new THREE.Vector2(x, -z); }));
+    const gm = new THREE.Mesh(new THREE.ShapeGeometry(shp), new THREE.MeshToonMaterial({ color: 0x8fcb8e, gradientMap: toonGrad }));
+    gm.rotation.x = -Math.PI / 2;
+    gm.position.y = 0.016;
+    gm.receiveShadow = true;
+    grp.add(gm);
+  }
+  globe.add(grp);
+  console.log('[OSM] ' + data.name + ': 道路セグメント' + nr + '・川' + nv + '・公園' + data.parks.length);
+}
+fetch('data/osm/tokyo.json').then(r => r.ok ? r.json() : null).then(j => { if (j) buildOsmCity(j); }).catch(() => {});
+
+// ---------- 雲（地球に張り付いて一緒に回る） ----------
+function placeClouds() {
+  // 影なしの真っ白＋3段もくもく（上から見ても「謎の板」にならない）
+  const cloudMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85 });
+  for (let i = 0; i < 140; i++) { // R拡大ぶん雲も増量
+    const c = new THREE.Group();
+    const m1 = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.45, 0.9), cloudMat);
+    const m2 = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.4, 0.7), cloudMat);
+    m2.position.set(0.65, 0.2, 0.15);
+    const m3 = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.35, 0.55), cloudMat);
+    m3.position.set(-0.55, 0.16, -0.1);
+    c.add(m1, m2, m3);
+    const dir = new THREE.Vector3().randomDirection();
+    c.position.copy(dir.clone().multiplyScalar(R + 3.8)); // 巡航高度より上の雲レイヤー
+    c.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    globe.add(c);
+  }
+}
+
+// ---------- 低空ディテール（チャンクLOD：足元に街並みが生える） ----------
+const CHUNK_DEG = 0.75, CHUNK_RADIUS_DEG = 2.5; // R=400に合わせ細かく狭く（フォグの外は作らない）
+const CHUNKS_X = Math.round(360 / CHUNK_DEG);
+const chunks = new Map(); // key -> Group（離れたら破棄）
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const HOUSE_COLORS = [0xf2dcc8, 0xe8d0d8, 0xd8e2c8, 0xe6e0cc];
+const BLDG_COLORS = [0xd8dce8, 0xe2d8e0, 0xcfd8d2, 0xe6e2d0, 0xa8c4dc, 0xc89484, 0xb8c8c0]; // ガラス青・レンガも混ぜて多様性
+function makeTreeG(rnd, leaf) { // キューブ樹冠（マイクラ風・街の縮小に合わせ小型化）
+  const t = new THREE.Group();
+  const c = leaf || 0x8fcb9b;
+  t.add(box(0.1, 0.26, 0.1, 0xc9a98f, 0, 0.13, 0));
+  t.add(box(0.34, 0.3, 0.34, c, 0, 0.4, 0));
+  t.add(box(0.2, 0.18, 0.2, c, 0, 0.62, 0));
+  return t;
+}
+// ボクセル建物ライブラリ（起動時に各種バリアントを焼いて、配置はクローン＝軽い）
+const VOXEL_LIB = { house: [], bldg: [], tower: [] };
+function buildVoxelLib() {
+  const r = mulberry32(20260612);
+  const ROOF_COLORS = [0xd99a8a, 0xc97f6f, 0xb8826a, 0x8fa3c8, 0xa8b890];
+  for (let v = 0; v < 5; v++) { // 家：壁＋段々屋根
+    const w = 0.28 + r() * 0.1, d = 0.28 + r() * 0.1, h = 0.14 + r() * 0.08;
+    const parts = [[0, 0, 0, w, h, d, HOUSE_COLORS[v % HOUSE_COLORS.length]]];
+    for (let s = 0; s < 3; s++) parts.push([0, h + s * 0.045, 0, (w + 0.07) * (1 - s / 3.2), 0.045, (d + 0.07) * (1 - s / 3.2), ROOF_COLORS[v]]);
+    const g = new THREE.Group();
+    g.add(voxelModel(0.045, parts));
+    const win = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.06, 0.08), windowMat);
+    win.position.set(-w / 2 - 0.012, h * 0.55, 0); g.add(win);
+    VOXEL_LIB.house.push(g);
+  }
+  for (let v = 0; v < 5; v++) { // 中層ビル：箱＋屋上設備
+    const w = 0.22 + r() * 0.12, d = 0.22 + r() * 0.12, h = 0.3 + r() * 0.3;
+    const g = new THREE.Group();
+    g.add(voxelModel(0.05, [[0, 0, 0, w, h, d, BLDG_COLORS[v % BLDG_COLORS.length]], [0.04, h, 0.03, w * 0.45, 0.06, d * 0.45, 0x9a958c]]));
+    const rows = Math.max(1, (h / 0.16) | 0);
+    for (let rr = 0; rr < rows; rr++) {
+      const win = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.05, d * 0.55), windowMat);
+      win.position.set(-w / 2 - 0.012, 0.08 + rr * 0.16, 0); g.add(win);
+    }
+    VOXEL_LIB.bldg.push(g);
+  }
+  for (let v = 0; v < 4; v++) { // 高層タワー：セットバック＋アンテナ
+    const w = 0.18 + r() * 0.1, h = 0.65 + r() * 0.5;
+    const parts = [[0, 0, 0, w, h, w, BLDG_COLORS[(v + 2) % BLDG_COLORS.length]]];
+    const setback = r() < 0.6;
+    if (setback) parts.push([0, h, 0, w * 0.55, 0.1, w * 0.55, BLDG_COLORS[(v + 2) % BLDG_COLORS.length]]);
+    parts.push([0, h + (setback ? 0.1 : 0), 0, 0.03, 0.16, 0.03, 0x9aa0a8]);
+    const g = new THREE.Group();
+    g.add(voxelModel(0.05, parts));
+    const rows = Math.max(2, (h / 0.14) | 0);
+    for (let rr = 0; rr < rows; rr++) {
+      const win = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.05, w * 0.6), windowMat);
+      win.position.set(-w / 2 - 0.012, 0.07 + rr * 0.14, 0); g.add(win);
+    }
+    VOXEL_LIB.tower.push(g);
+  }
+}
+buildVoxelLib();
+function makeHouseG(rnd) { return VOXEL_LIB.house[(rnd() * VOXEL_LIB.house.length) | 0].clone(); }
+function makeBuildingG(rnd) { return VOXEL_LIB.bldg[(rnd() * VOXEL_LIB.bldg.length) | 0].clone(); }
+function makeTowerG(rnd) { return VOXEL_LIB.tower[(rnd() * VOXEL_LIB.tower.length) | 0].clone(); }
+function makeBoatG(rnd) {
+  const b = new THREE.Group();
+  b.add(box(0.7, 0.18, 0.3, 0xe8e0d0, 0, 0.09, 0));
+  b.add(box(0.04, 0.55, 0.04, 0x9a8870, 0, 0.45, 0));
+  b.add(box(0.04, 0.4, 0.35, 0xf7f3e8, 0.02, 0.5, 0));
+  return b;
+}
+// 実在の主要山脈（ポリライン）。山脈の近くにだけ山を生やす＝「地場に沿った」生成のキモ
+const RANGES = [
+  [[36.5, 137.5], [35.6, 138.4]],                                              // 日本アルプス
+  [[35, 75], [28.5, 84], [27.6, 90], [28, 96]],                                // ヒマラヤ〜カラコルム
+  [[42, 75], [39.5, 71]],                                                      // 天山・パミール
+  [[10, -73], [-5, -78], [-15, -72], [-25, -68], [-35, -70], [-45, -72]],      // アンデス
+  [[60, -135], [52, -118], [44, -110], [38, -106]],                            // ロッキー
+  [[39.8, -120.5], [36.5, -118.3]],                                            // シエラネバダ
+  [[46.4, 6.8], [46.8, 10.2], [47.2, 13.5]],                                   // アルプス
+  [[42.7, -1.5], [42.4, 2.2]],                                                 // ピレネー
+  [[61.5, 7.5], [67.5, 15.5]],                                                 // スカンジナビア山脈
+  [[66, 60.5], [55.5, 58.5]],                                                  // ウラル
+  [[43.4, 40.5], [42.4, 45.5]],                                                // カフカス
+  [[33.2, -5.5], [30.8, -7.8]],                                                // アトラス
+  [[-28, 152], [-33, 150.5], [-37.5, 147]],                                    // グレートディバイディング
+  [[36.5, 71], [34.5, 66]],                                                    // ヒンドゥークシュ
+];
+function rangeDistDeg(lat, lon) {
+  let best = 1e9;
+  const c = Math.cos(lat * Math.PI / 180);
+  for (const pts of RANGES) {
+    for (let i = 0; i < pts.length - 1; i++) {
+      const ax = (pts[i][1] - lon) * c, ay = pts[i][0] - lat;
+      const bx = (pts[i + 1][1] - lon) * c, by = pts[i + 1][0] - lat;
+      const dx = bx - ax, dy = by - ay;
+      const t = Math.max(0, Math.min(1, -(ax * dx + ay * dy) / (dx * dx + dy * dy || 1)));
+      best = Math.min(best, Math.hypot(ax + dx * t, ay + dy * t));
+    }
+  }
+  return best;
+}
+function makeMountainG(rnd) { // ボクセル段々の山（マイクラ風）
+  const m = new THREE.Group();
+  const rock = rnd() < 0.5 ? 0x9aa49a : 0xa8a098;
+  const n = 3 + (rnd() * 2 | 0);
+  let y = 0, w = 0.9 + rnd() * 0.7;
+  const snowy = w > 1.2 || rnd() < 0.4;
+  for (let i = 0; i < n; i++) {
+    const h = 0.3 + rnd() * 0.2;
+    const c = snowy && i >= n - 1 ? 0xffffff : rock;
+    m.add(box(w, h, w, c, (rnd() - 0.5) * 0.12, y + h / 2, (rnd() - 0.5) * 0.12));
+    y += h; w *= 0.62 + rnd() * 0.12;
+  }
+  return m;
+}
+function cityDistDeg(lat, lon) {
+  const me = latLonToVec3(lat, lon, 1);
+  let d = 1e9;
+  for (const c of CITIES) d = Math.min(d, me.angleTo(latLonToVec3(c[1], c[2], 1)));
+  return d * 180 / Math.PI;
+}
+// ランドマークの聖域半径：この中には区画も散布も生やさない（被り防止＝主役を立てる）
+let lmVecs = null;
+function nearLandmark(lat, lon) {
+  if (!lmVecs) lmVecs = LANDMARKS.map(l => [latLonToVec3(l.lat, l.lon, 1), l.clear || 0.08]);
+  const me = latLonToVec3(lat, lon, 1);
+  for (const [v, r] of lmVecs) if (me.angleTo(v) * 180 / Math.PI < r) return true;
+  return false;
+}
+// 都市中心部＝碁盤目の区画生成（散布でなくブロック構造＝「街の写真」感のキモ）
+// 区画を半分に小型化＋チャンク単位の接平面グループに統合（プレートはインスタンス化）
+function buildCityBlocks(g, lat0, lon0) {
+  const cLat = lat0 + CHUNK_DEG / 2, cLon = lon0 + CHUNK_DEG / 2;
+  const n = latLonToVec3(cLat, cLon, 1);
+  const northT = new THREE.Vector3(0, 1, 0).addScaledVector(n, -n.y).normalize();
+  const east = northT.clone().cross(n).normalize();
+  const grp = new THREE.Group();
+  grp.position.copy(n.clone().multiplyScalar(LAND_R));
+  grp.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(east, n, northT.clone().negate()));
+  const kLat = R * Math.PI / 180, kLon = kLat * Math.cos(cLat * Math.PI / 180);
+  const G = 0.08; // 区画格子
+  const plates = [];
+  for (let glat = lat0 + G / 2; glat < lat0 + CHUNK_DEG; glat += G) {
+    for (let glon = lon0 + G / 2; glon < lon0 + CHUNK_DEG; glon += G) {
+      if (!maskAt(glat, glon)) continue;
+      if (nearLandmark(glat, glon)) continue; // ランドマークの聖域＝区画を生やさない
+      const d = cityDistDeg(glat, glon);
+      if (d > 0.38) continue;
+      const x = (glon - cLon) * kLon, z = -((glat - cLat) * kLat);
+      plates.push([x, z]);
+      const r2 = mulberry32((((glat * 1000) | 0) * 73856) ^ (((glon * 1000) | 0) * 19349));
+      const kind = r2();
+      if (kind < 0.12) { // 公園区画
+        const pk = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.018, 0.34), mat(0x9ed89a));
+        pk.position.set(x, 0.032, z); pk.receiveShadow = true; grp.add(pk);
+        const t = makeTreeG(r2); t.scale.setScalar(0.6); t.position.set(x, 0.035, z); grp.add(t);
+      } else if (kind < 0.25) { /* 空き区画＝駐車場（プレートのみ） */ }
+      else if (d < 0.12) { const b = makeTowerG(r2); b.position.set(x, 0.028, z); grp.add(b); } // 都心コア
+      else { // 中心市街＝1〜2棟
+        const nB = 1 + (r2() * 2 | 0);
+        for (let k = 0; k < nB; k++) {
+          const b = r2() < 0.6 ? makeBuildingG(r2) : makeHouseG(r2);
+          b.position.set(x + (nB > 1 ? (k - 0.5) * 0.2 : 0), 0.028, z + (nB > 1 ? (r2() - 0.5) * 0.18 : 0));
+          grp.add(b);
+        }
+      }
+    }
+  }
+  if (plates.length) { // アスファルトの区画プレート＝1ドローコール
+    const im = new THREE.InstancedMesh(new THREE.BoxGeometry(0.5, 0.025, 0.5), mat(0x787c84), plates.length);
+    const m4 = new THREE.Matrix4();
+    plates.forEach(([x, z], i) => { m4.makeTranslation(x, 0.013, z); im.setMatrixAt(i, m4); });
+    im.receiveShadow = true;
+    grp.add(im);
+  }
+  g.add(grp);
+}
+function buildChunk(ncx, cy) {
+  const g = new THREE.Group();
+  const rnd = mulberry32((ncx * 1000 + cy) * 2654435761);
+  const lat0 = cy * CHUNK_DEG - 90, lon0 = ncx * CHUNK_DEG - 180;
+  // 都市の近くのセルはサンプル数を増やして密度を出す（都市感のキモ）
+  const dCC = cityDistDeg(lat0 + CHUNK_DEG / 2, lon0 + CHUNK_DEG / 2);
+  if (dCC < 0.65) buildCityBlocks(g, lat0, lon0); // 都市中心は碁盤目区画で敷き詰める
+  const samples = dCC < 0.8 ? 12 : 9; // 郊外・自然の木も増量（はげ地対策）
+  for (let i = 0; i < samples; i++) {
+    const lat = lat0 + rnd() * CHUNK_DEG, lon = lon0 + rnd() * CHUNK_DEG;
+    const land = maskAt(lat, lon);
+    let obj = null;
+    if (!land) {
+      if (rnd() < 0.06) obj = makeBoatG(rnd);
+    } else {
+      const a = Math.abs(lat), dCity = cityDistDeg(lat, lon), dMt = rangeDistDeg(lat, lon);
+      if (nearLandmark(lat, lon)) { /* ランドマークの聖域＝散布しない */ }
+      else if (dCity < 0.38) { /* 区画生成済みゾーン＝散布しない */ }
+      else if (dCity < 0.6) obj = rnd() < 0.55 ? makeBuildingG(rnd) : makeHouseG(rnd);  // 市街地の外縁
+      else if (dMt < 1.3) { if (rnd() < 0.85) obj = makeMountainG(rnd); }               // 実在山脈の上＝岩山
+      else if (dCity < 1.5) { if (rnd() < 0.5) obj = rnd() < 0.4 ? makeHouseG(rnd) : makeTreeG(rnd); } // 郊外
+      else if (a > 66) { /* 氷原はまっさら */ }
+      else if (a > 15 && a < 30.5) { if (rnd() < 0.22) obj = makeTreeG(rnd, 0xa8b878); } // 乾燥帯はオリーブ色の低木をまばらに
+      else if (rnd() < 0.82) obj = makeTreeG(rnd, rnd() < 0.1 ? 0xf2c4d0 : 0x8fcb9b);  // 緑地（たまに桜）
+    }
+    if (obj) {
+      const p = latLonToVec3(lat, lon, land ? LAND_R : R);
+      obj.position.copy(p);
+      obj.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), p.clone().normalize());
+      obj.rotateY(rnd() * 6.28);
+      g.add(obj);
+    }
+  }
+  return g;
+}
+function updateChunks() {
+  const cyc = Math.floor((curLat + 90) / CHUNK_DEG);
+  const cxc = Math.floor((curLon + 180) / CHUNK_DEG);
+  const range = Math.ceil(CHUNK_RADIUS_DEG / CHUNK_DEG);
+  const need = new Set();
+  for (let dy = -range; dy <= range; dy++) {
+    const cy = cyc + dy;
+    const latMid = (cy + 0.5) * CHUNK_DEG - 90;
+    if (cy < 0 || cy >= 180 / CHUNK_DEG || Math.abs(latMid) > 78) continue;
+    const xr = Math.min(10, Math.ceil(range / Math.max(0.15, Math.cos(latMid * Math.PI / 180))));
+    for (let dx = -xr; dx <= xr; dx++) {
+      const ncx = ((cxc + dx) % CHUNKS_X + CHUNKS_X) % CHUNKS_X;
+      const key = ncx + ',' + cy;
+      need.add(key);
+      if (!chunks.has(key)) {
+        const g = buildChunk(ncx, cy);
+        chunks.set(key, g); globe.add(g);
+      }
+    }
+  }
+  for (const [key, g] of chunks) {
+    if (!need.has(key)) {
+      g.traverse(o => o.geometry && o.geometry.dispose());
+      globe.remove(g); chunks.delete(key);
+    }
+  }
+}
+
+// ---------- 魔女（v1スパイクと同じ子） ----------
+const witch = new THREE.Group();
+witch.add(box(0.9, 0.7, 0.7, 0x8d7ac8, 0, 0.1, 0));
+witch.add(box(0.62, 0.58, 0.62, 0xffe3c9, 0, 0.72, 0));
+witch.add(box(0.18, 0.3, 0.5, 0xe8965a, -0.36, 0.62, 0));
+const hat = new THREE.Group();
+hat.add(box(0.95, 0.1, 0.95, 0x6c5aa8, 0, 0, 0));
+hat.add(cone(0.42, 0.75, 0x6c5aa8, 0, 0.42, 0));
+hat.position.y = 1.08; witch.add(hat);
+witch.add(box(2.4, 0.12, 0.12, 0xc9a06a, 0, -0.32, 0));
+witch.add(box(0.55, 0.3, 0.3, 0xe8d9a0, -1.25, -0.32, 0));
+witch.add(box(0.3, 0.32, 0.3, 0x4a4458, -0.85, -0.08, 0));
+witch.add(box(0.1, 0.14, 0.1, 0x4a4458, -0.95, 0.16, 0.08));
+witch.scale.setScalar(0.22); // 街の縮小に合わせて魔女もさらに小さく＝世界が広い
+scene.add(witch);
+
+// ---------- 没入アニメーション（天気の見た目反映・気配） ----------
+const wxFx = { kind: 'clear' }; // 現在地の天気の種類（リアル天気と連動）
+// 雨・雪パーティクル
+const P_N = 450;
+const pGeo = new THREE.BufferGeometry();
+const pArr = new Float32Array(P_N * 3);
+for (let i = 0; i < P_N; i++) {
+  pArr[i * 3] = -1 + Math.random() * 12; // カメラ後方には降らせない（至近の粒が巨大に見えるため）
+  pArr[i * 3 + 1] = R - 2 + Math.random() * 8;
+  pArr[i * 3 + 2] = -6 + Math.random() * 12;
+}
+pGeo.setAttribute('position', new THREE.BufferAttribute(pArr, 3));
+const rainMat = new THREE.PointsMaterial({ color: 0x5878a0, size: 0.09, transparent: true, opacity: 0.85 });
+const snowMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.11, transparent: true, opacity: 0.9 });
+const precip = new THREE.Points(pGeo, rainMat);
+precip.visible = false; precip.frustumCulled = false;
+scene.add(precip);
+// ほうきのきらきら（魔法の余韻）
+const T_N = 70;
+const tGeo = new THREE.BufferGeometry();
+const tArr = new Float32Array(T_N * 3);
+const tAge = new Float32Array(T_N);
+for (let i = 0; i < T_N; i++) { tAge[i] = Math.random() * 1.2; tArr[i * 3 + 1] = R; }
+tGeo.setAttribute('position', new THREE.BufferAttribute(tArr, 3));
+const trailPts = new THREE.Points(tGeo, new THREE.PointsMaterial({ color: 0xffd2ec, size: 0.045, transparent: true, opacity: 0.55 }));
+trailPts.frustumCulled = false;
+scene.add(trailPts);
+// 渡り鳥（ときどき横切る）
+const flock = new THREE.Group();
+for (let i = 0; i < 5; i++) {
+  flock.add(box(0.1, 0.02, 0.16, 0x5a6478, i * 0.22, -Math.abs(i - 2) * 0.06, Math.abs(i - 2) * 0.3));
+}
+flock.visible = false;
+let flockTimer = 8;
+scene.add(flock);
+window.__wx = k => { wxFx.force = k; wxFx.kind = k || wxFx.kind; }; // 検証・デモ用：天気の見た目を強制（__wx(null)で解除）
+
+// ---------- 操作：向き（東西南北）と高度だけ。前進は自動＝ソアリン ----------
+const NAV = { alt: 1.2, ta: 1.2, minAlt: 0.9, maxAlt: 22, turn: 0 }; // 街の縮小に合わせ低空も下げる
+let boostTouch = false, boostCur = 1; // スペース/長押しの加速
+const keys = {};
+addEventListener('keydown', e => { if (e.key === ' ') e.preventDefault(); keys[e.key.toLowerCase()] = true; });
+addEventListener('keyup',   e => { keys[e.key.toLowerCase()] = false; });
+let drag = null, lpTimer = null, dragDist = 0;
+renderer.domElement.addEventListener('pointerdown', e => {
+  drag = { x: e.clientX, y: e.clientY };
+  dragDist = 0;
+  clearTimeout(lpTimer);
+  lpTimer = setTimeout(() => { if (dragDist < 14) boostTouch = true; }, 350); // 長押し＝ブースト（スマホ）
+});
+addEventListener('pointerup', () => { drag = null; clearTimeout(lpTimer); boostTouch = false; });
+addEventListener('pointermove', e => {
+  if (!drag) return;
+  dragDist += Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y);
+  NAV.turn += (e.clientX - drag.x) * 0.003;
+  NAV.ta = THREE.MathUtils.clamp(NAV.ta + (e.clientY - drag.y) * 0.02, NAV.minAlt, NAV.maxAlt);
+  drag = { x: e.clientX, y: e.clientY };
+});
+
+// 東京湾上空からスタート・西向き＝「湾→海岸線→街→東京タワーの脇を抜ける」オープニング飛行
+// （東京都心ど真ん中スタートだと東京タワーの中にスポーンしてしまう）
+globe.quaternion.setFromUnitVectors(latLonToVec3(35.70, 139.88, 1), new THREE.Vector3(0, 1, 0));
+function getBearing() {
+  const qi = globe.quaternion.clone().invert();
+  const p = new THREE.Vector3(0, 1, 0).applyQuaternion(qi);
+  const tdir = new THREE.Vector3(1, 0, 0).applyQuaternion(qi);
+  const pole = new THREE.Vector3(0, 1, 0);
+  const n = pole.clone().sub(p.clone().multiplyScalar(pole.dot(p))).normalize();
+  const e = n.clone().cross(p).normalize();
+  return (Math.atan2(tdir.dot(e), tdir.dot(n)) * 180 / Math.PI + 360) % 360;
+}
+{
+  const qy = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
+  const b0 = getBearing();
+  globe.quaternion.premultiply(qy.setFromAxisAngle(Y, 0.01));
+  const db = ((getBearing() - b0 + 540) % 360) - 180; // 0.01radあたりの方位変化量
+  const need = ((270 - b0 + 540) % 360) - 180;
+  globe.quaternion.premultiply(qy.setFromAxisAngle(Y, 0.01 * need / db - 0.01));
+}
+
+// ---------- 機内モニター（いま地球のどこ？） ----------
+// DayCity級カバレッジを目指す世界都市115（リストに足すだけでLODがビル群を生やす）
+const CITIES = [
+  // 日本
+  ['東京', 35.68, 139.76], ['大阪', 34.69, 135.50], ['名古屋', 35.18, 136.91], ['札幌', 43.06, 141.35], ['福岡', 33.59, 130.40], ['那覇', 26.21, 127.68],
+  // 東アジア
+  ['ソウル', 37.57, 126.98], ['釜山', 35.18, 129.08], ['北京', 39.90, 116.41], ['上海', 31.23, 121.47], ['広州', 23.13, 113.26], ['成都', 30.57, 104.07],
+  ['西安', 34.34, 108.94], ['香港', 22.32, 114.17], ['台北', 25.03, 121.57], ['ウランバートル', 47.89, 106.91],
+  // 東南アジア
+  ['ハノイ', 21.03, 105.85], ['ホーチミン', 10.82, 106.63], ['バンコク', 13.76, 100.50], ['プノンペン', 11.56, 104.92], ['ヤンゴン', 16.87, 96.20],
+  ['クアラルンプール', 3.14, 101.69], ['シンガポール', 1.35, 103.82], ['ジャカルタ', -6.21, 106.85], ['マニラ', 14.60, 120.98],
+  // 南アジア
+  ['デリー', 28.61, 77.21], ['ムンバイ', 19.08, 72.88], ['バンガロール', 12.97, 77.59], ['コルカタ', 22.57, 88.36], ['カトマンズ', 27.72, 85.32],
+  ['ダッカ', 23.81, 90.41], ['コロンボ', 6.93, 79.85], ['カラチ', 24.86, 67.01],
+  // 中東・中央アジア・ロシア
+  ['テヘラン', 35.69, 51.39], ['ドバイ', 25.20, 55.27], ['ドーハ', 25.29, 51.53], ['リヤド', 24.71, 46.68], ['テルアビブ', 32.07, 34.78],
+  ['イスタンブール', 41.01, 28.98], ['タシケント', 41.30, 69.24], ['アルマトイ', 43.24, 76.89], ['バクー', 40.41, 49.87], ['トビリシ', 41.72, 44.83],
+  ['モスクワ', 55.76, 37.62], ['サンクトペテルブルク', 59.93, 30.34], ['ウラジオストク', 43.12, 131.89],
+  // 欧州
+  ['ロンドン', 51.51, -0.13], ['パリ', 48.86, 2.35], ['ベルリン', 52.52, 13.41], ['ミュンヘン', 48.14, 11.58], ['フランクフルト', 50.11, 8.68],
+  ['アムステルダム', 52.37, 4.90], ['ブリュッセル', 50.85, 4.35], ['チューリッヒ', 47.38, 8.54], ['ウィーン', 48.21, 16.37], ['プラハ', 50.08, 14.44],
+  ['ブダペスト', 47.50, 19.04], ['ワルシャワ', 52.23, 21.01], ['キーウ', 50.45, 30.52], ['ローマ', 41.90, 12.50], ['ミラノ', 45.46, 9.19],
+  ['ベネチア', 45.44, 12.34], ['フィレンツェ', 43.77, 11.26], ['マドリード', 40.42, -3.70], ['バルセロナ', 41.39, 2.17], ['リスボン', 38.72, -9.14],
+  ['ダブリン', 53.35, -6.26], ['エディンバラ', 55.95, -3.19], ['オスロ', 59.91, 10.75], ['ストックホルム', 59.33, 18.07], ['コペンハーゲン', 55.68, 12.57],
+  ['ヘルシンキ', 60.17, 24.94], ['レイキャビク', 64.15, -21.94], ['アテネ', 37.98, 23.73],
+  // アフリカ
+  ['カイロ', 30.04, 31.24], ['カサブランカ', 33.57, -7.59], ['チュニス', 36.81, 10.18], ['アルジェ', 36.75, 3.06], ['ラゴス', 6.52, 3.38],
+  ['アクラ', 5.60, -0.19], ['アディスアベバ', 9.01, 38.76], ['ナイロビ', -1.29, 36.82], ['ダルエスサラーム', -6.79, 39.21],
+  ['ケープタウン', -33.92, 18.42], ['ヨハネスブルグ', -26.20, 28.05], ['アンタナナリボ', -18.88, 47.51],
+  // 北米・中米
+  ['ニューヨーク', 40.71, -74.01], ['ボストン', 42.36, -71.06], ['ワシントンDC', 38.91, -77.04], ['シカゴ', 41.88, -87.63], ['マイアミ', 25.76, -80.19],
+  ['シアトル', 47.61, -122.33], ['サンフランシスコ', 37.77, -122.42], ['ロサンゼルス', 34.05, -118.24], ['ラスベガス', 36.17, -115.14],
+  ['デンバー', 39.74, -104.99], ['トロント', 43.65, -79.38], ['バンクーバー', 49.28, -123.12], ['モントリオール', 45.50, -73.57],
+  ['アンカレッジ', 61.22, -149.90], ['ホノルル', 21.31, -157.86], ['メキシコシティ', 19.43, -99.13], ['ハバナ', 23.11, -82.37],
+  ['パナマシティ', 8.98, -79.52], ['グアテマラシティ', 14.63, -90.51],
+  // 南米
+  ['ボゴタ', 4.71, -74.07], ['キト', -0.18, -78.47], ['リマ', -12.05, -77.04], ['ラパス', -16.50, -68.15], ['サンティアゴ', -33.45, -70.67],
+  ['ブエノスアイレス', -34.60, -58.38], ['モンテビデオ', -34.90, -56.16], ['アスンシオン', -25.26, -57.58], ['サンパウロ', -23.55, -46.63],
+  ['リオデジャネイロ', -22.91, -43.17], ['ブラジリア', -15.79, -47.88], ['カラカス', 10.48, -66.90],
+  // オセアニア
+  ['シドニー', -33.87, 151.21], ['メルボルン', -37.81, 144.96], ['ブリスベン', -27.47, 153.03], ['パース', -31.95, 115.86],
+  ['オークランド', -36.85, 174.76], ['ウェリントン', -41.29, 174.78], ['スバ', -18.14, 178.44],
+];
+const mapCv = document.getElementById('map');
+const mapCtx = mapCv.getContext('2d');
+let mapBase = null;
+function buildMiniMap() {
+  const W = mapCv.width, H = mapCv.height;
+  const img = mapCtx.createImageData(W, H);
+  const land = [0xa0, 0xd4, 0x98], sea = [0xc2, 0xe4, 0xee];
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const c = maskAt(90 - y / H * 180, x / W * 360 - 180) ? land : sea;
+    const o = (y * W + x) * 4;
+    img.data[o] = c[0]; img.data[o + 1] = c[1]; img.data[o + 2] = c[2]; img.data[o + 3] = 255;
+  }
+  mapCtx.putImageData(img, 0, 0);
+  mapBase = mapCtx.getImageData(0, 0, W, H);
+}
+// ---- 国判定（countries-110mのポリゴン内外判定。色ラスタはAAで細い島が誤判定するためNG） ----
+const JA_NAMES = {
+  'Japan': '日本', 'South Korea': '韓国', 'North Korea': '北朝鮮', 'China': '中国', 'Taiwan': '台湾', 'Mongolia': 'モンゴル',
+  'Russia': 'ロシア', 'Vietnam': 'ベトナム', 'Thailand': 'タイ', 'Laos': 'ラオス', 'Cambodia': 'カンボジア', 'Myanmar': 'ミャンマー',
+  'Malaysia': 'マレーシア', 'Indonesia': 'インドネシア', 'Philippines': 'フィリピン', 'India': 'インド', 'Pakistan': 'パキスタン',
+  'Bangladesh': 'バングラデシュ', 'Nepal': 'ネパール', 'Bhutan': 'ブータン', 'Sri Lanka': 'スリランカ', 'Afghanistan': 'アフガニスタン',
+  'Iran': 'イラン', 'Iraq': 'イラク', 'Saudi Arabia': 'サウジアラビア', 'United Arab Emirates': 'アラブ首長国連邦', 'Oman': 'オマーン',
+  'Yemen': 'イエメン', 'Turkey': 'トルコ', 'Israel': 'イスラエル', 'Jordan': 'ヨルダン', 'Syria': 'シリア', 'Kazakhstan': 'カザフスタン',
+  'Uzbekistan': 'ウズベキスタン', 'Turkmenistan': 'トルクメニスタン', 'Kyrgyzstan': 'キルギス', 'Tajikistan': 'タジキスタン',
+  'Egypt': 'エジプト', 'Libya': 'リビア', 'Algeria': 'アルジェリア', 'Morocco': 'モロッコ', 'Tunisia': 'チュニジア', 'Sudan': 'スーダン',
+  'Ethiopia': 'エチオピア', 'Somalia': 'ソマリア', 'Kenya': 'ケニア', 'Tanzania': 'タンザニア', 'Nigeria': 'ナイジェリア', 'Ghana': 'ガーナ',
+  'South Africa': '南アフリカ', 'Madagascar': 'マダガスカル', 'Dem. Rep. Congo': 'コンゴ民主共和国', 'Angola': 'アンゴラ',
+  'Mozambique': 'モザンビーク', 'Zambia': 'ザンビア', 'Zimbabwe': 'ジンバブエ', 'Namibia': 'ナミビア', 'Botswana': 'ボツワナ',
+  'Mali': 'マリ', 'Niger': 'ニジェール', 'Chad': 'チャド', 'Mauritania': 'モーリタニア', 'Senegal': 'セネガル',
+  'France': 'フランス', 'Germany': 'ドイツ', 'United Kingdom': 'イギリス', 'Ireland': 'アイルランド', 'Spain': 'スペイン',
+  'Portugal': 'ポルトガル', 'Italy': 'イタリア', 'Switzerland': 'スイス', 'Austria': 'オーストリア', 'Netherlands': 'オランダ',
+  'Belgium': 'ベルギー', 'Denmark': 'デンマーク', 'Norway': 'ノルウェー', 'Sweden': 'スウェーデン', 'Finland': 'フィンランド',
+  'Iceland': 'アイスランド', 'Poland': 'ポーランド', 'Czechia': 'チェコ', 'Slovakia': 'スロバキア', 'Ukraine': 'ウクライナ',
+  'Belarus': 'ベラルーシ', 'Greece': 'ギリシャ', 'Romania': 'ルーマニア', 'Bulgaria': 'ブルガリア', 'Hungary': 'ハンガリー',
+  'Croatia': 'クロアチア', 'Serbia': 'セルビア', 'United States of America': 'アメリカ', 'Canada': 'カナダ', 'Mexico': 'メキシコ',
+  'Cuba': 'キューバ', 'Guatemala': 'グアテマラ', 'Panama': 'パナマ', 'Brazil': 'ブラジル', 'Argentina': 'アルゼンチン', 'Chile': 'チリ',
+  'Peru': 'ペルー', 'Bolivia': 'ボリビア', 'Colombia': 'コロンビア', 'Venezuela': 'ベネズエラ', 'Ecuador': 'エクアドル',
+  'Paraguay': 'パラグアイ', 'Uruguay': 'ウルグアイ', 'Australia': 'オーストラリア', 'New Zealand': 'ニュージーランド',
+  'Papua New Guinea': 'パプアニューギニア', 'Fiji': 'フィジー', 'Greenland': 'グリーンランド', 'Antarctica': '南極',
+};
+let countries = null;
+async function buildCountryIndex() {
+  try {
+    const topo = await (await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json')).json();
+    const fc = feature(topo, topo.objects.countries);
+    countries = fc.features.map(f => {
+      const polys = (f.geometry.type === 'Polygon' ? [f.geometry.coordinates] : f.geometry.coordinates).map(rings => {
+        let a = 180, b = 90, c = -180, d = -90;
+        for (const [x, y] of rings[0]) { a = Math.min(a, x); b = Math.min(b, y); c = Math.max(c, x); d = Math.max(d, y); }
+        return { bbox: [a, b, c, d], rings };
+      });
+      const en = (f.properties && f.properties.name) || '';
+      return { name: JA_NAMES[en] || en, polys };
+    });
+  } catch (e) { /* オフラインなら国名表示なしで続行 */ }
+}
+function inRing(lon, lat, ring) {
+  let ins = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    if ((yi > lat) !== (yj > lat) && lon < (xj - xi) * (lat - yi) / (yj - yi) + xi) ins = !ins;
+  }
+  return ins;
+}
+let ctryMemo = ['', null];
+function countryAt(lat, lon) {
+  if (!countries) return null;
+  const key = ((lat * 4) | 0) + ',' + ((lon * 4) | 0);
+  if (ctryMemo[0] === key) return ctryMemo[1];
+  let found = null;
+  outer: for (const c of countries) {
+    for (const p of c.polys) {
+      if (lon < p.bbox[0] || lon > p.bbox[2] || lat < p.bbox[1] || lat > p.bbox[3]) continue;
+      if (!inRing(lon, lat, p.rings[0])) continue;
+      let hole = false;
+      for (let k = 1; k < p.rings.length; k++) if (inRing(lon, lat, p.rings[k])) { hole = true; break; }
+      if (!hole) { found = c.name; break outer; }
+    }
+  }
+  ctryMemo = [key, found];
+  return found;
+}
+
+// ---- 「場所」のリアル天気（Open-Meteo・無料・キー不要） ----
+// 座標で連続取得すると今の旅速度では数秒ごとに天気が変わってしまうので、
+// 「最寄りの都市・ランドマークが切り替わった時だけ」その場所の天気を引く。
+const WX_NEAR_KM = 800, WX_CACHE_MS = 600000, WX_MIN_GAP_MS = 15000;
+let wx = '', wxPlace = '', wxBusy = false, wxLast = 0;
+const wxCache = new Map(); // 場所名 -> {v, t}
+function maybeFetchWeather() {
+  if (wxFx.force) { wxFx.kind = wxFx.force; return; } // デモ・検証の強制天気を優先
+  const np = nearestInfo;
+  if (!np || np.km > WX_NEAR_KM) { wx = ''; wxPlace = ''; wxFx.kind = 'clear'; return; } // 大海原では天気なし
+  if (np.name === wxPlace && wx) return; // 同じ場所にいる間は据え置き
+  wx = ''; wxFx.kind = 'clear'; // 場所が変わったら前の場所の天気を引きずらない
+  const hit = wxCache.get(np.name);
+  if (hit && Date.now() - hit.t < WX_CACHE_MS) { wx = hit.v; wxPlace = np.name; wxFx.kind = hit.k || 'clear'; return; }
+  if (wxBusy || Date.now() - wxLast < WX_MIN_GAP_MS) return;
+  wxBusy = true; wxLast = Date.now();
+  const place = np.name;
+  fetch(`https://api.open-meteo.com/v1/forecast?latitude=${np.lat.toFixed(2)}&longitude=${np.lon.toFixed(2)}&current=weather_code,temperature_2m`)
+    .then(r => r.json())
+    .then(j => {
+      const c = j.current.weather_code, t = Math.round(j.current.temperature_2m);
+      const w = c === 0 ? '快晴' : c <= 2 ? '晴れ' : c === 3 ? 'くもり' : c <= 48 ? '霧'
+        : c <= 57 ? '霧雨' : c <= 67 ? '雨' : c <= 77 ? '雪' : c <= 82 ? 'にわか雨' : c <= 86 ? '雪' : '雷雨';
+      const kind = c <= 2 ? 'clear' : c === 3 ? 'cloud' : c <= 48 ? 'fog' : c <= 67 ? 'rain' : c <= 77 ? 'snow' : c <= 82 ? 'rain' : c <= 86 ? 'snow' : 'storm';
+      const v = w + ' ' + t + '℃';
+      wxCache.set(place, { v, k: kind, t: Date.now() });
+      wx = v; wxPlace = place; wxFx.kind = kind;
+    })
+    .catch(() => {})
+    .finally(() => { wxBusy = false; });
+}
+
+const trail = [];
+let curLat = 0, curLon = 0, curBrg = 0, monT = 0, trailN = 0;
+let nearestInfo = null; // {name, km, lat, lon}（天気の取得対象＝「場所」）
+function nearestPlace() {
+  const me = latLonToVec3(curLat, curLon, 1);
+  let best = null, bestD = 1e9, bla = 0, blo = 0;
+  for (const [name, la, lo] of CITIES.concat(LANDMARKS.map(l => [l.name, l.lat, l.lon]))) {
+    const d = me.angleTo(latLonToVec3(la, lo, 1));
+    if (d < bestD) { bestD = d; best = name; bla = la; blo = lo; }
+  }
+  const km = bestD * 6371; // ミニ地球の角距離→実地球kmに読み替え
+  nearestInfo = { name: best, km, lat: bla, lon: blo };
+  return km < 400 ? best + ' の上空' : best + ' まで 約' + (Math.round(km / 100) * 100).toLocaleString() + 'km';
+}
+function drawMonitor() {
+  const W = mapCv.width, H = mapCv.height;
+  mapCtx.putImageData(mapBase, 0, 0);
+  const px = (lon, lat) => [(lon + 180) / 360 * W, (90 - lat) / 180 * H];
+  mapCtx.fillStyle = '#e0a83a'; // ランドマーク
+  for (const lm of LANDMARKS) { const [x, y] = px(lm.lon, lm.lat); mapCtx.fillRect(x - 1.5, y - 1.5, 3, 3); }
+  mapCtx.strokeStyle = '#b07ad0'; mapCtx.lineWidth = 1.4; // 旅の軌跡
+  mapCtx.beginPath();
+  for (let i = 0; i < trail.length; i++) {
+    const [x, y] = px(trail[i][1], trail[i][0]);
+    if (i === 0) { mapCtx.moveTo(x, y); continue; }
+    const [xp] = px(trail[i - 1][1], trail[i - 1][0]);
+    Math.abs(x - xp) > W / 2 ? mapCtx.moveTo(x, y) : mapCtx.lineTo(x, y); // 日付変更線またぎは線を切る
+  }
+  mapCtx.stroke();
+  const [mx, my] = px(curLon, curLat); // 現在地＝進行方向を向いた三角
+  mapCtx.save();
+  mapCtx.translate(mx, my);
+  mapCtx.rotate(curBrg * Math.PI / 180);
+  mapCtx.fillStyle = '#7a5ab8';
+  mapCtx.beginPath(); mapCtx.moveTo(0, -5); mapCtx.lineTo(3.5, 4); mapCtx.lineTo(-3.5, 4); mapCtx.closePath();
+  mapCtx.fill();
+  mapCtx.strokeStyle = '#fff'; mapCtx.lineWidth = 1; mapCtx.stroke();
+  mapCtx.restore();
+  const here = countryAt(curLat, curLon) ?? (maskAt(curLat, curLon) ? 'どこかの大地' : '海の上');
+  document.getElementById('place').innerHTML = '<b>' + here + '</b>' + (wx ? '・' + wx : '') + '<br>' + nearestPlace();
+  // 画面上部の現在地ラベル（世界地図を見なくても今どこか分かる）
+  const locEl = document.getElementById('loc');
+  const lmNear = nearestInfo && nearestInfo.km < 150 && LANDMARKS.some(l => l.name === nearestInfo.name);
+  locEl.classList.toggle('lm', !!lmNear);
+  locEl.textContent = lmNear ? nearestInfo.name
+    : (nearestInfo && nearestInfo.km < 400 ? here + '・' + nearestInfo.name : here);
+}
+
+// ---------- HUD ----------
+const $ = id => document.getElementById(id);
+const CARDINAL = ['北', '北東', '東', '南東', '南', '南西', '西', '北西'];
+function updateHud() {
+  const qi = globe.quaternion.clone().invert();
+  const p = new THREE.Vector3(0, 1, 0).applyQuaternion(qi); // 真下の地点（地球ローカル）
+  const lat = Math.asin(THREE.MathUtils.clamp(p.y, -1, 1)) * 180 / Math.PI;
+  const lon = Math.atan2(-p.z, p.x) * 180 / Math.PI;
+  const brg = getBearing();
+  curLat = lat; curLon = lon; curBrg = brg;
+  $('compass').textContent = '方位 ' + CARDINAL[Math.round(brg / 45) % 8] + ' ' + Math.round(brg) + '°';
+  $('alt').textContent = '高度 ' + NAV.alt.toFixed(1);
+  $('pos').textContent = Math.abs(lat).toFixed(1) + '°' + (lat >= 0 ? 'N' : 'S') + ' ' + Math.abs(lon).toFixed(1) + '°' + (lon >= 0 ? 'E' : 'W');
+}
+
+// ---------- 世界の更新 ----------
+const SKY_DAY = new THREE.Color(0xbde3f0), SKY_NIGHT = new THREE.Color(0x232b4a);
+const AMB_DAY = new THREE.Color(0xb8cfe8), AMB_NIGHT = new THREE.Color(0x46527c);
+const clock = new THREE.Clock();
+let simT = 0, bank = 0;
+const qTmp = new THREE.Quaternion();
+function stepWorld(dt) {
+  simT += dt;
+  // 入力 → 向き・高度
+  let turnIn = 0;
+  if (keys['arrowleft'] || keys['a'])  turnIn -= 1;
+  if (keys['arrowright'] || keys['d']) turnIn += 1;
+  NAV.turn += turnIn * 1.1 * dt;
+  if (keys['arrowup'] || keys['w'])   NAV.ta += 5 * dt;
+  if (keys['arrowdown'] || keys['s']) NAV.ta -= 5 * dt;
+  NAV.ta = THREE.MathUtils.clamp(NAV.ta, NAV.minAlt, NAV.maxAlt);
+  NAV.alt += (NAV.ta - NAV.alt) * Math.min(1, dt * 2.5);
+
+  // 向き転換＝地球を縦軸でまわす／前進＝地球を進行直交軸でまわす
+  if (NAV.turn !== 0) {
+    const d = NAV.turn * Math.min(1, dt * 4);
+    globe.quaternion.premultiply(qTmp.setFromAxisAngle(new THREE.Vector3(0, 1, 0), d));
+    NAV.turn -= d;
+  }
+  // 巡航＝地球一周およそ1時間。スペース/長押しでブースト
+  const boostOn = keys[' '] || boostTouch;
+  boostCur += ((boostOn ? 8 : 1) - boostCur) * Math.min(1, dt * 3);
+  const omega = (2 * Math.PI / 6000) * (1 + NAV.alt * 0.1) * boostCur; // 巡航一周およそ100分＝Google Earth級のスピード感（集中モードでは別途減速する想定）。デモはブースト8倍で
+  globe.quaternion.premultiply(qTmp.setFromAxisAngle(new THREE.Vector3(0, 0, 1), omega * dt));
+
+  // 魔女
+  witch.position.set(0, LAND_R + NAV.alt + Math.sin(simT * 1.6) * 0.03, 0); // 高度は陸面基準＝地下に潜らない
+  bank += (THREE.MathUtils.clamp(NAV.turn * 2.5, -0.55, 0.55) - bank) * Math.min(1, dt * 5);
+  witch.rotation.x = bank;
+  witch.rotation.z = -0.08 + THREE.MathUtils.clamp((NAV.ta - NAV.alt) * 0.06, -0.3, 0.3) + Math.sin(simT * 1.6 + 0.6) * 0.04;
+
+  // 太陽は地球ローカル固定 → 回すと昼夜がめぐる
+  const sunW = SUN_LOCAL.clone().applyQuaternion(globe.quaternion);
+  sunLight.position.copy(witch.position).addScaledVector(sunW, 60); // 影カメラを魔女の周りに追従させる
+  sunLight.target.position.copy(witch.position);
+  const day = THREE.MathUtils.clamp(sunW.y * 1.3 + 0.25, 0, 1); // 頭上の昼度
+  sunLight.intensity = 0.25 + 1.45 * day;
+  amb.color.copy(AMB_NIGHT).lerp(AMB_DAY, day);
+  scene.background = SKY_NIGHT.clone().lerp(SKY_DAY, day);
+  const grey = (wxFx.kind === 'rain' || wxFx.kind === 'storm') ? 0.45
+    : (wxFx.kind === 'cloud' || wxFx.kind === 'snow' || wxFx.kind === 'fog') ? 0.28 : 0;
+  if (grey) scene.background.lerp(new THREE.Color(0x98a2ae), grey); // 悪天候はどんより
+  sunLight.intensity *= (1 - grey * 0.45);
+  scene.fog.color.copy(scene.background);
+  windowMat.emissive.setRGB(0.8 * (1 - day), 0.55 * (1 - day), 0.25 * (1 - day)); // 夜はビッグベンの文字盤が灯る
+  starMat.opacity = THREE.MathUtils.clamp(0.9 - day * 2.2, 0, 0.9); // 夜だけ満天の星
+  sunBall.position.copy(witch.position).addScaledVector(sunW, 950);
+  moonBall.position.copy(witch.position).addScaledVector(sunW, -950);
+
+  // --- 没入アニメーション ---
+  if (wxFx.kind === 'rain' || wxFx.kind === 'storm' || wxFx.kind === 'snow') { // 雨・雪
+    precip.visible = true;
+    precip.material = wxFx.kind === 'snow' ? snowMat : rainMat;
+    const fall = wxFx.kind === 'snow' ? 1.4 : 9;
+    const pp = pGeo.attributes.position;
+    for (let i = 0; i < P_N; i++) {
+      let y = pp.getY(i) - fall * dt;
+      let x = pp.getX(i) - 0.6 * dt;
+      if (wxFx.kind === 'snow') x += Math.sin(simT * 1.5 + i) * 0.4 * dt;
+      if (y < witch.position.y - 4) { y += 8; x = witch.position.x - 1 + Math.random() * 12; }
+      if (x < witch.position.x - 1) x += 12;
+      pp.setXYZ(i, x, y, pp.getZ(i));
+    }
+    pp.needsUpdate = true;
+  } else precip.visible = false;
+
+  { // ほうきのきらきら
+    const tp = tGeo.attributes.position;
+    for (let i = 0; i < T_N; i++) {
+      tAge[i] += dt;
+      if (tAge[i] > 1.2) {
+        tAge[i] = 0;
+        tp.setXYZ(i, witch.position.x - 0.28 + (Math.random() - 0.5) * 0.08, witch.position.y - 0.08 + (Math.random() - 0.5) * 0.08, witch.position.z + (Math.random() - 0.5) * 0.08);
+      } else {
+        tp.setXYZ(i, tp.getX(i) - 0.55 * dt, tp.getY(i) - 0.1 * dt, tp.getZ(i) + Math.sin(simT * 3 + i) * 0.05 * dt);
+      }
+    }
+    tp.needsUpdate = true;
+  }
+
+  flockTimer -= dt; // 渡り鳥
+  if (!flock.visible && flockTimer <= 0) {
+    flock.visible = true;
+    flock.position.set(witch.position.x + 9, witch.position.y + (Math.random() - 0.3) * 1.5, (Math.random() - 0.5) * 8);
+  }
+  if (flock.visible) {
+    flock.position.x -= 1.6 * dt;
+    flock.children.forEach((b, i) => { b.position.y = -Math.abs(i - 2) * 0.06 + Math.sin(simT * 6 + i) * 0.05; }); // はばたき
+    if (flock.position.x < witch.position.x - 9) { flock.visible = false; flockTimer = 12 + Math.random() * 25; }
+  }
+
+  updateHud();
+
+  // 機内モニター更新（0.4秒ごと）
+  monT += dt;
+  if (monT > 0.4) {
+    monT = 0;
+    if (++trailN % 8 === 0) { // 約3秒ごとに記録＝1時間ぶんの旅路が残る
+      trail.push([curLat, curLon]);
+      if (trail.length > 1200) trail.shift();
+    }
+    if (mapBase) { updateChunks(); maybeFetchWeather(); drawMonitor(); }
+  }
+}
+function render() {
+  const k = THREE.MathUtils.clamp((NAV.alt - 5) / (NAV.maxAlt - 5), 0, 1); // 高高度ほど見下ろしフレーミングへ
+  scene.fog.near = 3 + NAV.alt * 1.5 + k * 100; scene.fog.far = 35 + NAV.alt * 25 + k * 700; // 地平線まで世界が見える広さ（低空の地平線≈31ユニットを超える描画距離＝Google Earth的な開け感）
+  const back = 1.0 + NAV.alt * (0.5 + k * 0.45), up = 0.45 + NAV.alt * 0.32;
+  camera.position.set(witch.position.x - back, witch.position.y + up, witch.position.z * 0.85);
+  const target = new THREE.Vector3(witch.position.x + 2.2 + NAV.alt * 0.3, witch.position.y - 0.16, 0)
+    .lerp(new THREE.Vector3(0, R * 0.7, 0), k * 0.42);
+  camera.lookAt(target);
+  camera.rotateZ(bank * 0.35);
+  camera.fov = 58 + 6 * (boostCur - 1) / 7; // ブースト中はちょい広角＝疾走感
+  camera.updateProjectionMatrix();
+  renderer.render(scene, camera);
+}
+function tick() {
+  stepWorld(Math.min(clock.getDelta(), 0.05));
+  render();
+  requestAnimationFrame(tick);
+}
+// 検証・早送り用フック（タブ非表示中はrAFが止まるため）
+window.__step = sec => { for (let i = 0, n = Math.round(sec * 30); i < n; i++) stepWorld(1 / 30); render(); };
+window.__near = () => { // デバッグ：魔女の近くにあるランドマーク一覧
+  const out = [], wp = witch.position;
+  for (const o of globe.children) {
+    if (!o.name || !o.name.startsWith('lm:')) continue;
+    const p = o.position.clone().applyQuaternion(globe.quaternion);
+    const d = p.distanceTo(wp);
+    if (d < 6) out.push(o.name + ' d=' + d.toFixed(2));
+  }
+  return out.join(' / ');
+};
+
+// ---------- 起動 ----------
+await Promise.all([buildLandMask(), buildCountryIndex()]);
+buildGlobeMesh();
+placeLandmarks();
+placeClouds();
+buildMiniMap();
+document.getElementById('note').textContent =
+  '←→/ドラッグ横＝向き（東西南北） ↑↓/ドラッグ縦＝高度 ｜ 前進は自動 ｜ 本物の海岸線・実座標ランドマーク・昼夜は地球の現在地連動';
+resize();
+tick();
+</script>
+</body>
+</html>
