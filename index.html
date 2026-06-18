@@ -1159,6 +1159,9 @@ function updateHud() {
 // ---------- 世界の更新 ----------
 const SKY_DAY = new THREE.Color(0xbde3f0), SKY_NIGHT = new THREE.Color(0x232b4a);
 const AMB_DAY = new THREE.Color(0xb8cfe8), AMB_NIGHT = new THREE.Color(0x46527c);
+// 夕焼け・朝焼けの帯：昼夜の境目で空・大気・陽光が茜に染まる（FocusTown「窓の外が流れる」の空版・アセットゼロ・完全無料）
+const SKY_DUSK = new THREE.Color(0xff9d6e), AMB_DUSK = new THREE.Color(0xd98a6a);
+const SUN_DAY = new THREE.Color(0xfff4dd), SUN_DUSK = new THREE.Color(0xff8a52);
 const clock = new THREE.Clock();
 let simT = 0, bank = 0;
 const qTmp = new THREE.Quaternion();
@@ -1200,6 +1203,11 @@ function stepWorld(dt) {
   sunLight.intensity = 0.25 + 1.45 * day;
   amb.color.copy(AMB_NIGHT).lerp(AMB_DAY, day);
   scene.background = SKY_NIGHT.clone().lerp(SKY_DAY, day);
+  // 夕焼け帯：太陽が地平線近傍（sunW.y≈0.05）のときだけ茜へ。生の太陽高度でトリガー＝薄明帯を正確に捉える。寄与は控えめ（集中で目が疲れない）
+  const duskT = THREE.MathUtils.clamp(1 - Math.abs(sunW.y - 0.05) / 0.20, 0, 1);
+  scene.background.lerp(SKY_DUSK, duskT * 0.55);
+  amb.color.lerp(AMB_DUSK, duskT * 0.4);
+  sunLight.color.copy(SUN_DAY).lerp(SUN_DUSK, duskT * 0.7);
   const grey = (wxFx.kind === 'rain' || wxFx.kind === 'storm') ? 0.45
     : (wxFx.kind === 'cloud' || wxFx.kind === 'snow' || wxFx.kind === 'fog') ? 0.28 : 0;
   if (grey) scene.background.lerp(new THREE.Color(0x98a2ae), grey); // 悪天候はどんより
